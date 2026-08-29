@@ -23,6 +23,10 @@ BarWidget {
     readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
     readonly property bool configured: root.url !== ""
 
+    // 3c. Layout
+    implicitWidth: barContent.implicitWidth + 10
+    implicitHeight: root.barSize
+
     // === 5. ATTACHED OBJECTS & BEHAVIORS ===
     Accessible.role: Accessible.Button
     Accessible.name: "Uptime Monitor"
