@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "no.koka.uptime-monitor",
   "name": "Uptime Monitor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "koka.no",
   "license": "MIT",
   "description": "Monitor a URL from the bar. Green dot when up, red when down. Click for details.",
