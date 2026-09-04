@@ -394,9 +394,9 @@ BarWidget {
         });
     }
     onLabelChanged: {
-        if (panelLoader.item) {
+        if (panelLoader.item)
             panelLoader.item.syncFromWidget();
-        }
+
     }
     Component.onCompleted: Qt.callLater(root.arm)
 
@@ -419,14 +419,16 @@ BarWidget {
         id: probeProcess
 
         running: false
-        command: ["sh", "-c", "start=$(date +%s%3N) && " + "code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 '" + root.url + "' 2>/dev/null) && " + "end=$(date +%s%3N) && echo \"$code $((end - start))\""]
+        // URL is passed as its own argv element (never interpolated into a
+        // shell string), and timing comes from curl itself.
+        command: ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}", "--connect-timeout", "5", "--max-time", "10", "--proto", "=https,http", "--", root.url]
         onExited: function(exitCode) {
             var now = new Date();
             var st = root.emptyStatus();
             st.lastChecked = Qt.formatDateTime(now, "dd MMM HH:mm:ss");
             if (exitCode === 0 && probeOut.data) {
                 var parts = String(probeOut.data).trim().split(" ");
-                var code = parts[0], time = parseInt(parts[1], 10) || 0;
+                var code = parts[0], time = Math.round(parseFloat(parts[1]) * 1000) || 0;
                 if (root.isCronSchedule(root.parseSchedule(root.schedule))) {
                     root._scheduleArm();
                 } else {

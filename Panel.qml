@@ -272,6 +272,7 @@ Panel {
                     }
 
                     Text {
+                        textFormat: Text.PlainText
                         text: root.statusText()
                         // CONVENTION-EXCEPTION: status indicator colors for up/down states
                         color: root.statusColor()
@@ -281,6 +282,7 @@ Panel {
                     }
 
                     Text {
+                        textFormat: Text.PlainText
                         text: root.hostWidget ? root.hostWidget.scheduleLabel(root.hostWidget.schedule) : ""
                         color: Qt.darker(root.barForeground, 1.4)
                         font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -293,6 +295,7 @@ Panel {
                 Text {
                     width: parent.width
                     visible: root.urlW() !== "" && root.statusW().lastChecked && root.statusW().lastChecked !== "—"
+                    textFormat: Text.PlainText
                     text: "Last checked " + root.statusW().lastChecked
                     color: Qt.darker(root.barForeground, 1.4)
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
