@@ -23,6 +23,9 @@ Panel {
     property string edCron: "0 * * * *"
     property bool edIsCron: false
     property bool suppressSync: false
+    // Set by Stop. The URL stays in the field so monitoring can be started
+    // again, which means closing the panel must not commit it.
+    property bool userStopped: false
 
     // === 9. FUNCTIONS ===
     function urlW() {
@@ -109,6 +112,7 @@ Panel {
         if (!root.hostWidget || !root.canCommit())
             return ;
 
+        root.userStopped = false;
         root.hostWidget.persist({
             "url": root.normalizedUrl(),
             "label": root.edLabel.trim(),
@@ -149,6 +153,7 @@ Panel {
     }
 
     function stop() {
+        root.userStopped = true;
         root.suppressSync = true;
         if (root.hostWidget)
             root.hostWidget.persist({
@@ -158,12 +163,15 @@ Panel {
     }
 
     function open() {
+        root.userStopped = false;
         root.syncFromWidget();
         root.controller.show();
     }
 
     function close() {
-        root.commit();
+        if (!root.userStopped)
+            root.commit();
+
         root.controller.hide();
     }
 
@@ -185,11 +193,12 @@ Panel {
         return Qt.formatDateTime(n, "dd MMM HH:mm");
     }
 
-    function dotColor(s) {
-        if (!s || s.up === null)
-            return Qt.lighter(Color.background, 1.3);
+    function urgentColor() {
+        return root.bar ? root.bar.urgent : Color.urgent;
+    }
 
-        return s.up ? Color.accent : root.bar.urgent;
+    function dotColor(s) {
+        return root.hostWidget ? root.hostWidget.dotColor(s) : Color.muted;
     }
 
     function statusText() {
@@ -211,7 +220,7 @@ Panel {
         if (!s || s.up === null)
             return Qt.darker(root.barForeground, 1.4);
 
-        return s.up ? Color.accent : root.bar.urgent;
+        return s.up ? root.hostWidget.upColor : root.urgentColor();
     }
 
     objectName: "uptimeMonitorPanel"
@@ -316,6 +325,7 @@ Panel {
                     }
 
                     TextField {
+                        objectName: "urlField"
                         width: parent.width
                         text: root.edUrl
                         placeholderText: "example.com"
@@ -449,7 +459,7 @@ Panel {
                             text: root.edCron
                             placeholderText: "min hour dom month dow (0 * * * *)"
                             foreground: root.barForeground
-                            accent: root.cronOk() ? Color.accent : root.bar.urgent
+                            accent: root.cronOk() ? Color.accent : root.urgentColor()
                             font.family: root.bar ? root.bar.fontFamily : Style.font.family
                             font.pixelSize: Style.font.body
                             onTextChanged: root.edCron = text
@@ -466,7 +476,7 @@ Panel {
                             visible: root.edCron.trim() !== ""
                             text: root.cronOk() ? "Next: " + root.nextCronText() : "Needs 5 cron fields"
                             // CONVENTION-EXCEPTION: status indicator colors
-                            color: root.cronOk() ? Qt.darker(root.barForeground, 1.4) : root.bar.urgent
+                            color: root.cronOk() ? Qt.darker(root.barForeground, 1.4) : root.urgentColor()
                             font.family: root.bar ? root.bar.fontFamily : Style.font.family
                             font.pixelSize: Style.font.caption
                             wrapMode: Text.WordWrap
@@ -494,10 +504,11 @@ Panel {
                     }
 
                     Button {
+                        objectName: "stopButton"
                         width: root.urlW() === "" ? parent.width : (parent.width - Style.space(8)) / 2
                         text: root.urlW() === "" ? "Start monitoring" : "Stop"
                         focusable: true
-                        foreground: root.urlW() === "" ? root.barForeground : root.bar.urgent
+                        foreground: root.urlW() === "" ? root.barForeground : root.urgentColor()
                         accent: Color.accent
                         fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
                         fontSize: Style.font.body

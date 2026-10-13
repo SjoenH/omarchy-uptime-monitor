@@ -20,6 +20,14 @@ BarWidget {
     property var status: root.emptyStatus()
     readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
     readonly property bool configured: root.url !== ""
+    // CONVENTION-EXCEPTION: "up" is green on every theme. The theme's accent
+    // can be any hue, including the red used for "down".
+    readonly property color upColor: "#00cc66"
+    // Search horizon for the next cron run. Eight years covers the rarest
+    // valid schedule: Feb 29 across a century year that is not a leap year.
+    readonly property int cronHorizonDays: 366 * 8
+    // URL the probe currently in flight was started for.
+    property string probedUrl: ""
 
     // === 9. FUNCTIONS (private first, then public) ===
     function _emptyStatus() {
@@ -91,33 +99,48 @@ BarWidget {
         return "every " + x.value + uname;
     }
 
+    // Expand one cron field into the set of values it allows. The range is
+    // clipped to [min, max] and the step is at least 1, so a malformed field
+    // read from shell.json can never expand without bound.
     function _cronField(pattern, min, max) {
         var allowed = {
         };
         var parts = String(pattern).split(",");
         for (var i = 0; i < parts.length; i++) {
             var p = parts[i].trim(), step = 1, base = p;
-            if (p.indexOf("/") >= 0) {
-                step = parseInt(p.split("/")[1], 10) || 1;
-                base = p.split("/")[0];
+            var slash = p.indexOf("/");
+            if (slash >= 0) {
+                step = Math.max(1, parseInt(p.slice(slash + 1), 10) || 1);
+                base = p.slice(0, slash);
             }
-            if (base === "*")
-                base = min + "-" + max;
-
-            if (base.indexOf("-") >= 0) {
-                var lo = parseInt(base.split("-")[0], 10), hi = parseInt(base.split("-")[1], 10);
-                if (!isNaN(lo) && !isNaN(hi))
-                    for (var v = lo; v <= hi; v += step) allowed[v] = true;
-
+            var lo, hi;
+            if (base === "*") {
+                lo = min;
+                hi = max;
+            } else if (base.indexOf("-") >= 0) {
+                lo = parseInt(base.split("-")[0], 10);
+                hi = parseInt(base.split("-")[1], 10);
             } else {
-                var single = parseInt(base, 10);
-                if (!isNaN(single))
-                    allowed[single] = true;
-                else if (step > 1 && p.indexOf("/") >= 0)
-                    for (var v2 = min; v2 <= max; v2 += step) allowed[v2] = true;
+                // "5/15" is a range from 5 to the end of the field.
+                lo = parseInt(base, 10);
+                hi = slash >= 0 ? max : lo;
             }
+            if (isNaN(lo) || isNaN(hi))
+                continue;
+
+            lo = Math.max(lo, min);
+            hi = Math.min(hi, max);
+            for (var v = lo; v <= hi; v += step) allowed[v] = true;
         }
         return allowed;
+    }
+
+    function _sortedValues(allowed) {
+        var out = [];
+        for (var key in allowed) out.push(parseInt(key, 10));
+        return out.sort(function(a, b) {
+            return a - b;
+        });
     }
 
     function _nextCronRun(cron, from) {
@@ -128,17 +151,38 @@ BarWidget {
         var fmin = root._cronField(f[0], 0, 59), fhour = root._cronField(f[1], 0, 23);
         var fdom = root._cronField(f[2], 1, 31), fmonth = root._cronField(f[3], 1, 12), fdow = root._cronField(f[4], 0, 7);
         var domStar = String(f[2]).trim() === "*", dowStar = String(f[4]).trim() === "*";
-        var d = new Date(from.getTime());
-        d.setSeconds(0, 0);
-        d.setMinutes(d.getMinutes() + 1);
-        for (var guard = 0; guard < 366 * 24 * 60; guard++) {
-            var monthOk = fmonth[d.getMonth() + 1] === true, domOk = fdom[d.getDate()] === true;
-            var dow = d.getDay(), dowOk = (fdow[dow] === true) || (dow === 0 && fdow[7] === true);
-            var dayOk = (domStar && dowStar) ? true : (domStar ? dowOk : (dowStar ? domOk : (domOk || dowOk)));
-            if (monthOk && dayOk && fhour[d.getHours()] === true && fmin[d.getMinutes()] === true)
-                return d;
+        var hours = root._sortedValues(fhour), minutes = root._sortedValues(fmin);
+        var start = new Date(from.getTime());
+        start.setSeconds(0, 0);
+        start.setMinutes(start.getMinutes() + 1);
+        // Walk whole days and only look at the clock on a day that matches.
+        // Stepping minute by minute froze the shell for about half a second
+        // on a yearly schedule and up to two on one that never matches
+        // (Feb 30), on every keystroke in the cron field.
+        for (var offset = 0; offset <= root.cronHorizonDays; offset++) {
+            var day = new Date(start.getFullYear(), start.getMonth(), start.getDate() + offset);
+            if (fmonth[day.getMonth() + 1] !== true)
+                continue;
 
-            d.setMinutes(d.getMinutes() + 1);
+            var domOk = fdom[day.getDate()] === true;
+            var dow = day.getDay(), dowOk = (fdow[dow] === true) || (dow === 0 && fdow[7] === true);
+            var dayOk = (domStar && dowStar) ? true : (domStar ? dowOk : (dowStar ? domOk : (domOk || dowOk)));
+            if (!dayOk)
+                continue;
+
+            for (var h = 0; h < hours.length; h++) {
+                for (var m = 0; m < minutes.length; m++) {
+                    var run = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hours[h], minutes[m], 0, 0);
+                    // A time skipped by a daylight-saving change comes back
+                    // as a different hour: it does not exist on this day.
+                    if (run.getHours() !== hours[h] || run.getMinutes() !== minutes[m])
+                        continue;
+
+                    if (run.getTime() >= start.getTime())
+                        return run;
+
+                }
+            }
         }
         return null;
     }
@@ -226,11 +270,17 @@ BarWidget {
         return (ms / 1000).toFixed(2) + "s";
     }
 
-    function dotColor(s) {
-        if (!s || s.up === null)
-            return Qt.lighter(Color.background, 1.3);
+    function urgentColor() {
+        return root.bar ? root.bar.urgent : Color.urgent;
+    }
 
-        return s.up ? Color.accent : root.bar.urgent;
+    function dotColor(s) {
+        // Muted reads on light and dark bars alike; a lightened background
+        // was invisible on a light bar.
+        if (!root.configured || !s || s.up === null)
+            return Color.muted;
+
+        return s.up ? root.upColor : root.urgentColor();
     }
 
     // --- Public API ---
@@ -291,25 +341,19 @@ BarWidget {
     }
 
     function persist(patch) {
-        var urlChanged = patch && patch.url !== undefined && patch.url !== root.url;
-        var schedChanged = patch && patch.schedule !== undefined;
-        if (patch) {
-            if (patch.url !== undefined)
-                root.url = patch.url;
-
-            if (patch.label !== undefined)
-                root.label = patch.label;
-
-            if (patch.schedule !== undefined)
-                root.schedule = root._parseSchedule(patch.schedule);
-
-        }
+        patch = patch || {
+        };
         var entry = {
             "id": root.moduleName,
-            "url": root.url,
-            "label": root.label,
-            "schedule": root.schedule
+            "url": patch.url !== undefined ? patch.url : root.url,
+            "label": patch.label !== undefined ? patch.label : root.label,
+            "schedule": patch.schedule !== undefined ? root._parseSchedule(patch.schedule) : root.schedule
         };
+        var urlChanged = entry.url !== root.url;
+        var schedChanged = JSON.stringify(entry.schedule) !== JSON.stringify(root.schedule);
+        // url, label and schedule are bound to settings. Assigning the entry
+        // updates all three; assigning them one by one would break those
+        // bindings, and later changes to shell.json would be ignored.
         root.settings = entry;
         if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
             root.bar.shell.updateEntryInline(root.moduleName, entry);
@@ -334,11 +378,22 @@ BarWidget {
         root.arm();
     }
 
-    function arm() {
-        if (!root.configured)
+    function _startProbe() {
+        if (!root.configured || probeProcess.running)
             return ;
 
+        root.probedUrl = root.url;
         probeProcess.running = true;
+    }
+
+    function arm() {
+        if (!root.configured) {
+            // Stopped: no more checks, and no stale up/down left on the dot.
+            checkTimer.stop();
+            root.status = root.emptyStatus();
+            return ;
+        }
+        root._startProbe();
         root._scheduleArm();
     }
 
@@ -408,10 +463,13 @@ BarWidget {
         repeat: false
         running: false
         onTriggered: {
+            if (!root.configured)
+                return ;
+
             if (root.isCronSchedule(root.parseSchedule(root.schedule)))
                 root._scheduleArm();
 
-            probeProcess.running = true;
+            root._startProbe();
         }
     }
 
@@ -423,6 +481,12 @@ BarWidget {
         // shell string), and timing comes from curl itself.
         command: ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}", "--connect-timeout", "5", "--max-time", "10", "--proto", "=https,http", "--", root.url]
         onExited: function(exitCode) {
+            // The URL was cleared or changed while curl was running, so this
+            // result is for something that is no longer being monitored.
+            if (root.probedUrl !== root.url) {
+                Qt.callLater(root._startProbe);
+                return ;
+            }
             var now = new Date();
             var st = root.emptyStatus();
             st.lastChecked = Qt.formatDateTime(now, "dd MMM HH:mm:ss");
@@ -504,6 +568,7 @@ BarWidget {
             spacing: 6
 
             Rectangle {
+                objectName: "statusDot"
                 anchors.verticalCenter: parent.verticalCenter
                 width: 10
                 height: 10
@@ -521,11 +586,13 @@ BarWidget {
             }
 
             Text {
+                objectName: "barLabel"
                 visible: root.label !== ""
                 anchors.verticalCenter: parent.verticalCenter
+                // The label is user-supplied: never parse it as rich text.
+                textFormat: Text.PlainText
                 text: root.label
-                // CONVENTION-EXCEPTION: fallback color for null bar context
-                color: root.bar ? root.bar.foreground : Style.colorText
+                color: root.bar ? root.bar.foreground : Color.foreground
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.body
             }
