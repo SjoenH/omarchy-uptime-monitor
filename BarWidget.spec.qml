@@ -97,7 +97,7 @@ Item {
         yield 400;
         w.open();
         yield 50;
-        h.click(h.byName("stopButton"));
+        h.click(h.byName("monitorButton"));
         yield 50;
         h.compare(w.url, "", "Stop clears the monitored URL");
         w.close();
@@ -138,9 +138,9 @@ Item {
         yield 400;
         w.open();
         yield 50;
-        h.click(h.byName("stopButton"));
+        h.click(h.byName("monitorButton"));
         yield 50;
-        h.click(h.byName("stopButton"));
+        h.click(h.byName("monitorButton"));
         yield 500;
         h.compare(w.url, server + "/ok", "the same button starts monitoring again");
         h.compare(w.status.up, true);
@@ -276,6 +276,143 @@ Item {
     function test_theWidgetFitsTheBar() {
         var w = monitor(server + "/ok", null, "Local");
         h.compare(w.implicitHeight, h.bar.barSize);
+    }
+
+    // --- The panel's card --------------------------------------------------
+
+    function* test_theCardReportsUpWithTheResponseTime() {
+        var w = monitor(server + "/ok", {
+            "value": 5,
+            "unit": "min"
+        }, "Local");
+        yield 500;
+        w.open();
+        yield 50;
+        var card = h.byName("statusCard");
+        h.compare(card.visible, true);
+        h.compare(card.name, "Local");
+        h.compare(card.detail, server + "/ok");
+        h.compare(card.value, "Up");
+        h.verify(/^\d+(ms|\.\d\ds)$/.test(card.note), "response time, got " + card.note);
+        h.verify(Qt.colorEqual(card.valueColor, w.upColor));
+        h.compare(h.byName("historySummary").text, "100% up \u00b7 1 check");
+        h.compare(h.byName("nextCheck").text, "next in 5m");
+        h.verify(/^Checked at \d\d:\d\d, every 5m$/.test(h.byName("titleCaption").text), h.byName("titleCaption").text);
+    }
+
+    function* test_theCardSaysWhyItIsDown() {
+        var w = monitor(server + "/error");
+        yield 500;
+        w.open();
+        yield 50;
+        var card = h.byName("statusCard");
+        h.compare(card.name, "127.0.0.1:" + h.env("SPEC_HTTP_PORT"), "without a label the card is named after the host");
+        h.compare(card.value, "Down");
+        h.compare(card.note, "HTTP 500");
+        h.verify(Qt.colorEqual(card.valueColor, h.bar.urgent));
+    }
+
+    function* test_anUnconfiguredPanelOffersToStart() {
+        var w = monitor("");
+        yield 50;
+        w.open();
+        yield 50;
+        h.compare(h.byName("statusCard").visible, false);
+        h.compare(h.byName("titleCaption").text, "Nothing is being watched yet");
+        var button = h.byName("monitorButton");
+        h.compare(button.text, "Start monitoring");
+        h.compare(button.enabled, false, "nothing to start until a URL is typed");
+        h.click(h.byName("urlField"));
+        h.type("example.invalid");
+        h.compare(button.enabled, true);
+    }
+
+    // --- History -----------------------------------------------------------
+
+    function* test_everyCheckIsAddedToTheHistory() {
+        var w = monitor(server + "/ok", {
+            "value": 1,
+            "unit": "sec"
+        });
+        yield 2600;
+        h.verify(w.history.length >= 2, "one sample per check, got " + w.history.length);
+        h.compare(w.history[0].up, true);
+        h.verify(w.history[0].at <= w.history[1].at, "oldest first");
+    }
+
+    function* test_theHistoryIsCappedAndKeepsTheNewest() {
+        var w = monitor("");
+        var samples = [];
+        for (var i = 0; i < w.historyCapacity + 5; i++) samples.push({
+            "up": true,
+            "ms": i,
+            "at": i
+        })
+        w.history = samples;
+        w.settings = {
+            "url": server + "/error",
+            "schedule": {
+                "value": 30,
+                "unit": "sec"
+            }
+        };
+        yield 500;
+        h.compare(w.history.length, 1, "a new URL starts a new history");
+        w.history = samples.concat(w.history);
+        w.arm();
+        yield 500;
+        h.compare(w.history.length, w.historyCapacity);
+        h.compare(w.history[w.history.length - 1].up, false, "the check that just ran is the last sample");
+    }
+
+    function* test_stoppingClearsTheHistory() {
+        var w = monitor(server + "/ok");
+        yield 400;
+        h.compare(w.history.length, 1);
+        w.persist({
+            "url": ""
+        });
+        yield 50;
+        h.compare(w.history.length, 0);
+    }
+
+    function* test_theGraphDrawsOneBarPerCheckNewestLast() {
+        var w = monitor(server + "/ok", {
+            "value": 30,
+            "unit": "sec"
+        });
+        yield 400;
+        w.history = [{
+            "up": true,
+            "ms": 100,
+            "at": 1
+        }, {
+            "up": false,
+            "ms": 0,
+            "at": 2
+        }, {
+            "up": true,
+            "ms": 50,
+            "at": 3
+        }];
+        w.open();
+        yield 50;
+        var graph = h.byName("historyGraph");
+        var last = w.historyCapacity - 1;
+        var slow = h.byName("historyBar-" + (last - 2)), down = h.byName("historyBar-" + (last - 1)), fast = h.byName("historyBar-" + last);
+        h.verify(Qt.colorEqual(slow.color, w.upColor) && Qt.colorEqual(fast.color, w.upColor), "up checks are green");
+        h.verify(Qt.colorEqual(down.color, h.bar.urgent), "a failed check is the urgent colour");
+        h.compare(slow.height, graph.height, "the slowest check sets the scale");
+        h.compare(down.height, graph.height, "a failed check is full height");
+        h.verify(fast.height < slow.height && fast.height >= graph.height / 4, "a faster check is a shorter bar: " + fast.height);
+        h.verify(h.byName("historyBar-0").height < graph.height / 4, "an empty slot is only a tick");
+        h.compare(h.byName("historySummary").text, "67% up \u00b7 3 checks");
+        w.history = w.history.concat([{
+            "up": true,
+            "ms": 10,
+            "at": 4
+        }]);
+        h.compare(h.byName("historySummary").text, "75% up \u00b7 4 checks");
     }
 
     // --- Cron --------------------------------------------------------------

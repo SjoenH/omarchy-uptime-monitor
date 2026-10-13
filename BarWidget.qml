@@ -28,6 +28,16 @@ BarWidget {
     readonly property int cronHorizonDays: 366 * 8
     // URL the probe currently in flight was started for.
     property string probedUrl: ""
+    // When the last check finished and when the next one is due, in
+    // milliseconds since the epoch; 0 while unknown. The panel draws the wait
+    // between the two.
+    property double lastCheckAt: 0
+    property double nextCheckAt: 0
+    // The most recent checks of the current URL as [{ up, ms, at }], oldest
+    // first, for the panel's history graph. Kept in memory only, so it starts
+    // empty with the shell.
+    property var history: []
+    readonly property int historyCapacity: 40
 
     // === 9. FUNCTIONS (private first, then public) ===
     function _emptyStatus() {
@@ -251,16 +261,19 @@ BarWidget {
         return root._cronFieldOk(f[0], 0, 59) && root._cronFieldOk(f[1], 0, 23) && root._cronFieldOk(f[2], 1, 31) && root._cronFieldOk(f[3], 1, 12) && root._cronFieldOk(f[4], 0, 7);
     }
 
+    function _startTimer(ms, repeat) {
+        checkTimer.interval = ms;
+        checkTimer.repeat = repeat;
+        checkTimer.restart();
+        root.nextCheckAt = Date.now() + ms;
+    }
+
     function _scheduleArm() {
         var nxt = root._nextScheduleRun(root.schedule, new Date());
-        if (nxt) {
-            checkTimer.interval = Math.max(1000, nxt.getTime() - Date.now());
-            checkTimer.repeat = false;
-        } else {
-            checkTimer.interval = 60 * 1000;
-            checkTimer.repeat = true;
-        }
-        checkTimer.start();
+        if (nxt)
+            root._startTimer(Math.max(1000, nxt.getTime() - Date.now()), false);
+        else
+            root._startTimer(60 * 1000, true);
     }
 
     function _formatTime(ms) {
@@ -391,6 +404,8 @@ BarWidget {
             // Stopped: no more checks, and no stale up/down left on the dot.
             checkTimer.stop();
             root.status = root.emptyStatus();
+            root.lastCheckAt = 0;
+            root.nextCheckAt = 0;
             return ;
         }
         root._startProbe();
@@ -441,6 +456,8 @@ BarWidget {
     // === 8. SIGNAL HANDLERS ===
     onBarChanged: injectPanel()
     onUrlChanged: {
+        // The history belongs to the URL that was being checked.
+        root.history = [];
         if (panelLoader.item)
             panelLoader.item.syncFromWidget();
 
@@ -493,13 +510,10 @@ BarWidget {
             if (exitCode === 0 && probeOut.data) {
                 var parts = String(probeOut.data).trim().split(" ");
                 var code = parts[0], time = Math.round(parseFloat(parts[1]) * 1000) || 0;
-                if (root.isCronSchedule(root.parseSchedule(root.schedule))) {
+                if (root.isCronSchedule(root.parseSchedule(root.schedule)))
                     root._scheduleArm();
-                } else {
-                    checkTimer.interval = root.scheduleMs(root.schedule);
-                    checkTimer.repeat = true;
-                    checkTimer.start();
-                }
+                else
+                    root._startTimer(root.scheduleMs(root.schedule), true);
                 if (code && (code[0] === "2" || code[0] === "3")) {
                     st.up = true;
                     st.responseTime = time;
@@ -514,13 +528,17 @@ BarWidget {
                 st.up = false;
                 st.consecutiveFailures = (root.status.consecutiveFailures || 0) + 1;
                 st.lastError = exitCode === 28 ? "Timeout" : "Connection failed";
-                if (!root.isCronSchedule(root.parseSchedule(root.schedule))) {
-                    checkTimer.interval = root.scheduleMs(root.schedule);
-                    checkTimer.repeat = true;
-                    checkTimer.start();
-                }
+                if (!root.isCronSchedule(root.parseSchedule(root.schedule)))
+                    root._startTimer(root.scheduleMs(root.schedule), true);
+
             }
             root.status = st;
+            root.lastCheckAt = now.getTime();
+            root.history = root.history.concat([{
+                "up": st.up,
+                "ms": st.responseTime,
+                "at": now.getTime()
+            }]).slice(-root.historyCapacity);
         }
 
         stdout: StdioCollector {

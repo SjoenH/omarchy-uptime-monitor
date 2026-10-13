@@ -26,6 +26,12 @@ Panel {
     // Set by Stop. The URL stays in the field so monitoring can be started
     // again, which means closing the panel must not commit it.
     property bool userStopped: false
+    // Wall clock, ticking while the panel is open, for the wait to the next check.
+    property double nowMs: Date.now()
+    readonly property color foreground: root.barForeground
+    readonly property color dim: Qt.darker(root.foreground, 1.55)
+    readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+    readonly property bool monitoring: root.urlW() !== ""
 
     // === 9. FUNCTIONS ===
     function urlW() {
@@ -164,6 +170,7 @@ Panel {
 
     function open() {
         root.userStopped = false;
+        root.nowMs = Date.now();
         root.syncFromWidget();
         root.controller.show();
     }
@@ -212,13 +219,95 @@ Panel {
         return s.up ? "Up" : "Down";
     }
 
+    // The arched line over the title: when it was last checked, and how often.
+    function captionText() {
+        if (!root.monitoring)
+            return "Nothing is being watched yet";
+
+        var last = root.hostWidget ? root.hostWidget.lastCheckAt : 0;
+        var every = root.hostWidget.scheduleLabel(root.hostWidget.schedule);
+        if (last <= 0)
+            return "Checking now, then " + every;
+
+        return "Checked at " + Qt.formatTime(new Date(last), "HH:mm") + ", " + every;
+    }
+
+    // Host name of the monitored URL, for the card when there is no label.
+    function hostOf(url) {
+        var m = /^[a-z][a-z0-9+.-]*:\/\/([^\/?#]+)/i.exec(String(url));
+        return m ? m[1] : String(url);
+    }
+
+    function cardName() {
+        return root.labelW() !== "" ? root.labelW() : root.hostOf(root.urlW());
+    }
+
+    // Under the status: how fast it answered, or why it is down.
+    function cardNote() {
+        var s = root.statusW();
+        if (!s || s.up === null || !root.hostWidget)
+            return "";
+
+        if (s.up)
+            return root.hostWidget.formatTime(s.responseTime);
+
+        return s.lastError + (s.consecutiveFailures > 1 ? " ×" + s.consecutiveFailures : "");
+    }
+
+    function historyW() {
+        return root.hostWidget ? root.hostWidget.history : [];
+    }
+
+    // Under the graph, on the left: how much of the shown history was up.
+    function historySummary() {
+        var checks = root.historyW();
+        if (checks.length === 0)
+            return "No checks yet";
+
+        var up = 0;
+        for (var i = 0; i < checks.length; i++) {
+            if (checks[i].up)
+                up++;
+
+        }
+        // Never round a history with a failure in it up to 100%.
+        var percent = up === checks.length ? 100 : Math.min(99, Math.round(100 * up / checks.length));
+        return percent + "% up \u00b7 " + checks.length + (checks.length === 1 ? " check" : " checks");
+    }
+
+    // Under the graph, on the right: how long until the next check.
+    function nextCheckText() {
+        var next = root.hostWidget ? root.hostWidget.nextCheckAt : 0;
+        if (!root.monitoring || next <= 0)
+            return "";
+
+        var seconds = Math.max(0, Math.round((next - root.nowMs) / 1000));
+        if (seconds < 60)
+            return "next in " + seconds + "s";
+
+        if (seconds < 3600)
+            return "next in " + Math.round(seconds / 60) + "m";
+
+        if (seconds < 86400)
+            return "next in " + Math.floor(seconds / 3600) + "h " + Math.round((seconds % 3600) / 60) + "m";
+
+        return "next in " + Math.round(seconds / 86400) + "d";
+    }
+
+    function toggleMonitoring() {
+        if (root.monitoring)
+            root.stop();
+        else
+            root.commit();
+    }
+
     function statusColor() {
         var s = root.statusW();
         if (root.urlW() === "")
-            return Qt.darker(root.barForeground, 1.4);
+            return root.dim;
 
         if (!s || s.up === null)
-            return Qt.darker(root.barForeground, 1.4);
+            return root.dim;
 
         return s.up ? root.hostWidget.upColor : root.urgentColor();
     }
@@ -231,6 +320,13 @@ Panel {
     Accessible.name: "Uptime Monitor Configuration"
 
     // === 6. CHILD OBJECTS ===
+    Timer {
+        interval: 1000
+        repeat: true
+        running: root.opened
+        onTriggered: root.nowMs = Date.now()
+    }
+
     KeyboardPanel {
         id: panel
 
@@ -239,7 +335,7 @@ Panel {
         bar: root.bar
         open: root.opened
         focusTarget: keyCatcher
-        contentWidth: panel.fittedContentWidth(Style.space(280))
+        contentWidth: panel.fittedContentWidth(Style.space(340))
         contentHeight: panel.fittedContentHeight(content.implicitHeight)
 
         PanelKeyCatcher {
@@ -256,60 +352,94 @@ Panel {
 
                 width: parent.width
                 spacing: Style.space(12)
-                padding: Style.space(4)
 
-                Text {
+                PanelTitle {
                     width: parent.width
-                    text: "Uptime Monitor"
-                    color: root.barForeground
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.subtitle
-                    font.bold: true
-                }
+                    caption: root.captionText()
+                    leftWord: "Uptime"
+                    rightWord: "Monitor"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
 
-                Row {
-                    spacing: Style.space(8)
-                    visible: root.urlW() !== ""
-
+                    // The bar's dot, with a halo: the status at a glance.
                     Rectangle {
-                        width: 10
-                        height: 10
-                        radius: 5
-                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.centerIn: parent
+                        width: Math.round(parent.width * 0.74)
+                        height: width
+                        radius: width / 2
                         // CONVENTION-EXCEPTION: status indicator colors for up/down states
-                        color: root.dotColor(root.statusW())
-                    }
+                        color: Util.alpha(root.dotColor(root.statusW()), 0.22)
 
-                    Text {
-                        textFormat: Text.PlainText
-                        text: root.statusText()
-                        // CONVENTION-EXCEPTION: status indicator colors for up/down states
-                        color: root.statusColor()
-                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                        font.pixelSize: Style.font.body
-                        font.bold: true
-                    }
+                        Rectangle {
+                            objectName: "titleDot"
+                            anchors.centerIn: parent
+                            width: Math.round(parent.width * 0.5)
+                            height: width
+                            radius: width / 2
+                            // CONVENTION-EXCEPTION: status indicator colors for up/down states
+                            color: root.dotColor(root.statusW())
+                        }
 
-                    Text {
-                        textFormat: Text.PlainText
-                        text: root.hostWidget ? root.hostWidget.scheduleLabel(root.hostWidget.schedule) : ""
-                        color: Qt.darker(root.barForeground, 1.4)
-                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                        font.pixelSize: Style.font.caption
-                        anchors.verticalCenter: parent.verticalCenter
                     }
 
                 }
 
-                Text {
+                StatCard {
+                    objectName: "statusCard"
                     width: parent.width
-                    visible: root.urlW() !== "" && root.statusW().lastChecked && root.statusW().lastChecked !== "—"
-                    textFormat: Text.PlainText
-                    text: "Last checked " + root.statusW().lastChecked
-                    color: Qt.darker(root.barForeground, 1.4)
-                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                    font.pixelSize: Style.font.caption
-                    wrapMode: Text.WordWrap
+                    visible: root.monitoring
+                    name: root.cardName()
+                    detail: root.urlW()
+                    value: root.statusText()
+                    // CONVENTION-EXCEPTION: status indicator colors for up/down states
+                    valueColor: root.statusColor()
+                    note: root.cardNote()
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+
+                    Column {
+                        width: parent.width
+                        spacing: Style.spacing.md
+
+                        HistoryGraph {
+                            objectName: "historyGraph"
+                            width: parent.width
+                            samples: root.historyW()
+                            capacity: root.hostWidget ? root.hostWidget.historyCapacity : 40
+                            foreground: root.foreground
+                            upColor: root.hostWidget ? root.hostWidget.upColor : root.foreground
+                            downColor: root.urgentColor()
+                        }
+
+                        Item {
+                            width: parent.width
+                            implicitHeight: historyCaption.implicitHeight
+
+                            Text {
+                                id: historyCaption
+
+                                objectName: "historySummary"
+                                textFormat: Text.PlainText
+                                text: root.historySummary()
+                                color: root.dim
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                            }
+
+                            Text {
+                                objectName: "nextCheck"
+                                anchors.right: parent.right
+                                textFormat: Text.PlainText
+                                text: root.nextCheckText()
+                                color: root.dim
+                                font.family: root.fontFamily
+                                font.pixelSize: Style.font.caption
+                            }
+
+                        }
+
+                    }
+
                 }
 
                 Column {
@@ -317,9 +447,10 @@ Panel {
                     spacing: Style.space(2)
 
                     Text {
+                        textFormat: Text.PlainText
                         text: "URL"
-                        color: Qt.darker(root.barForeground, 1.4)
-                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        color: root.dim
+                        font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         font.bold: true
                     }
@@ -329,10 +460,11 @@ Panel {
                         width: parent.width
                         text: root.edUrl
                         placeholderText: "example.com"
-                        foreground: root.barForeground
+                        foreground: root.foreground
                         accent: Color.accent
-                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.family: root.fontFamily
                         font.pixelSize: Style.font.body
+                        Accessible.name: "URL to monitor"
                         onTextChanged: root.edUrl = text
                         onAccepted: root.commit()
                         Keys.onEscapePressed: root.close()
@@ -345,21 +477,24 @@ Panel {
                     spacing: Style.space(2)
 
                     Text {
+                        textFormat: Text.PlainText
                         text: "Label (optional)"
-                        color: Qt.darker(root.barForeground, 1.4)
-                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        color: root.dim
+                        font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         font.bold: true
                     }
 
                     TextField {
+                        objectName: "labelField"
                         width: parent.width
                         text: root.edLabel
                         placeholderText: "My Site"
-                        foreground: root.barForeground
+                        foreground: root.foreground
                         accent: Color.accent
-                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        font.family: root.fontFamily
                         font.pixelSize: Style.font.body
+                        Accessible.name: "Label shown in the bar"
                         onTextChanged: root.edLabel = text
                         onAccepted: root.commit()
                         Keys.onEscapePressed: root.close()
@@ -372,9 +507,10 @@ Panel {
                     spacing: Style.space(8)
 
                     Text {
-                        text: "Check every:"
-                        color: Qt.darker(root.barForeground, 1.4)
-                        font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                        textFormat: Text.PlainText
+                        text: "Check every"
+                        color: root.dim
+                        font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         font.bold: true
                     }
@@ -389,10 +525,10 @@ Panel {
                             "label": "Cron"
                         }]
                         value: root.edIsCron ? "cron" : "simple"
-                        foreground: root.barForeground
+                        foreground: root.foreground
                         background: Color.background
                         accent: Color.accent
-                        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                        fontFamily: root.fontFamily
                         fontSize: Style.font.body
                         onChanged: function(mode) {
                             root.switchMode(mode);
@@ -411,9 +547,9 @@ Panel {
                             from: 1
                             to: 100000
                             stepSize: 1
-                            foreground: root.barForeground
+                            foreground: root.foreground
                             accent: Color.accent
-                            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                            fontFamily: root.fontFamily
                             onModified: function(v) {
                                 root.edValue = v;
                                 root.applySchedule();
@@ -436,10 +572,10 @@ Panel {
                                 "label": "Day"
                             }]
                             value: root.edUnit
-                            foreground: root.barForeground
+                            foreground: root.foreground
                             background: Color.background
                             accent: Color.accent
-                            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                            fontFamily: root.fontFamily
                             fontSize: Style.font.caption
                             onChanged: function(u) {
                                 root.edUnit = u;
@@ -455,13 +591,15 @@ Panel {
                         visible: root.edIsCron
 
                         TextField {
+                            objectName: "cronField"
                             width: parent.width
                             text: root.edCron
                             placeholderText: "min hour dom month dow (0 * * * *)"
-                            foreground: root.barForeground
+                            foreground: root.foreground
                             accent: root.cronOk() ? Color.accent : root.urgentColor()
-                            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                            font.family: root.fontFamily
                             font.pixelSize: Style.font.body
+                            Accessible.name: "Cron expression"
                             onTextChanged: root.edCron = text
                             onAccepted: {
                                 if (root.cronOk())
@@ -472,12 +610,14 @@ Panel {
                         }
 
                         Text {
+                            objectName: "cronHint"
                             width: parent.width
                             visible: root.edCron.trim() !== ""
+                            textFormat: Text.PlainText
                             text: root.cronOk() ? "Next: " + root.nextCronText() : "Needs 5 cron fields"
                             // CONVENTION-EXCEPTION: status indicator colors
-                            color: root.cronOk() ? Qt.darker(root.barForeground, 1.4) : root.urgentColor()
-                            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                            color: root.cronOk() ? root.dim : root.urgentColor()
+                            font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                             wrapMode: Text.WordWrap
                         }
@@ -486,41 +626,16 @@ Panel {
 
                 }
 
-                Row {
+                ActionButton {
+                    objectName: "monitorButton"
                     width: parent.width
-                    spacing: Style.space(8)
-
-                    Button {
-                        width: (parent.width - Style.space(8)) / 2
-                        visible: root.urlW() !== ""
-                        text: "Save"
-                        focusable: true
-                        foreground: root.barForeground
-                        accent: Color.accent
-                        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-                        fontSize: Style.font.body
-                        enabled: root.canCommit()
-                        onClicked: root.commit()
-                    }
-
-                    Button {
-                        objectName: "stopButton"
-                        width: root.urlW() === "" ? parent.width : (parent.width - Style.space(8)) / 2
-                        text: root.urlW() === "" ? "Start monitoring" : "Stop"
-                        focusable: true
-                        foreground: root.urlW() === "" ? root.barForeground : root.urgentColor()
-                        accent: Color.accent
-                        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-                        fontSize: Style.font.body
-                        enabled: root.urlW() !== "" || root.canCommit()
-                        onClicked: {
-                            if (root.urlW() === "")
-                                root.commit();
-                            else
-                                root.stop();
-                        }
-                    }
-
+                    text: root.monitoring ? "Stop monitoring" : "Start monitoring"
+                    // CONVENTION-EXCEPTION: stopping is the destructive action
+                    textColor: root.monitoring ? root.urgentColor() : root.foreground
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    enabled: root.monitoring || root.canCommit()
+                    onClicked: root.toggleMonitoring()
                 }
 
             }
