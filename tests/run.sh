@@ -18,11 +18,27 @@ if [[ ! -d $shell_src/Commons || ! -d $shell_src/Ui ]]; then
 fi
 command -v qs >/dev/null || { echo "qs (Quickshell) not found" >&2; exit 2; }
 
+# Quickshell runs the shell in a child of `qs`, and after a crash it leaves a
+# reporter process behind. Neither exits with `qs`, and either would keep a
+# pipe open forever, so each run writes to a file and is hunted down afterwards
+# by a marker in its environment.
+kill_leftovers() {
+  local env
+  for env in /proc/[0-9]*/environ; do
+    if grep -qzx "SPEC_RUN_ID=$1" "$env" 2>/dev/null; then
+      kill -9 "$(basename "$(dirname "$env")")" 2>/dev/null
+    fi
+  done
+}
+
 # A throwaway shell config: the real Commons and Ui modules, plus the harness.
 # KeyboardPanel is the one host component swapped out, because it is a
 # layer-shell window and cannot map without a compositor.
 work=$(mktemp -d)
+run_id=""
 cleanup() {
+  # Also on Ctrl-C: the run in progress must not outlive the script.
+  [[ -n $run_id ]] && kill_leftovers "$run_id"
   rm -rf "$work"
   declare -F spec_teardown >/dev/null && spec_teardown
 }
@@ -36,19 +52,6 @@ cp "$here/harness/KeyboardPanel.qml" "$work/Ui/KeyboardPanel.qml"
 [[ -f $here/setup.sh ]] && source "$here/setup.sh"
 
 if [[ $# -gt 0 ]]; then specs=("$@"); else specs=("$plugin"/*.spec.qml); fi
-
-# Quickshell runs the shell in a child of `qs`, and after a crash it leaves a
-# reporter process behind. Neither exits with `qs`, and either would keep a
-# pipe open forever, so each run writes to a file and is hunted down afterwards
-# by a marker in its environment.
-kill_leftovers() {
-  local env
-  for env in /proc/[0-9]*/environ; do
-    if grep -qzx "SPEC_RUN_ID=$1" "$env" 2>/dev/null; then
-      kill -9 "$(basename "$(dirname "$env")")" 2>/dev/null
-    fi
-  done
-}
 
 # Each spec runs once west and once east of UTC, so date math that mixes
 # local and UTC time fails here rather than for a user in another timezone.
