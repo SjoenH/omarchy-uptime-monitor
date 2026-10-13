@@ -20,6 +20,28 @@ BarWidget {
     property var status: root.emptyStatus()
     readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
     readonly property bool configured: root.url !== ""
+    // CONVENTION-EXCEPTION: "up" is green on every theme. The theme's accent
+    // can be any hue, including the red used for "down".
+    readonly property color upColor: "#00cc66"
+    // Search horizon for the next cron run. Eight years covers the rarest
+    // valid schedule: Feb 29 across a century year that is not a leap year.
+    readonly property int cronHorizonDays: 366 * 8
+    // URL the probe currently in flight was started for.
+    property string probedUrl: ""
+    // When the last check finished and when the next one is due, in
+    // milliseconds since the epoch; 0 while unknown. The panel draws the wait
+    // between the two.
+    property double lastCheckAt: 0
+    property double nextCheckAt: 0
+    // The most recent checks of the current URL as [{ up, ms, at }], oldest
+    // first, for the panel's history graph. Kept in memory only, so it starts
+    // empty with the shell.
+    property var history: []
+    readonly property int historyCapacity: 40
+    // Qt's Timer holds its interval in 32 bits, so a wait of more than 24.8
+    // days wraps around: the timer never fires and Qt logs an error in a
+    // tight loop. A longer wait is slept through a day at a time.
+    readonly property int maxTimerMs: 24 * 60 * 60 * 1000
 
     // === 9. FUNCTIONS (private first, then public) ===
     function _emptyStatus() {
@@ -91,33 +113,48 @@ BarWidget {
         return "every " + x.value + uname;
     }
 
+    // Expand one cron field into the set of values it allows. The range is
+    // clipped to [min, max] and the step is at least 1, so a malformed field
+    // read from shell.json can never expand without bound.
     function _cronField(pattern, min, max) {
         var allowed = {
         };
         var parts = String(pattern).split(",");
         for (var i = 0; i < parts.length; i++) {
             var p = parts[i].trim(), step = 1, base = p;
-            if (p.indexOf("/") >= 0) {
-                step = parseInt(p.split("/")[1], 10) || 1;
-                base = p.split("/")[0];
+            var slash = p.indexOf("/");
+            if (slash >= 0) {
+                step = Math.max(1, parseInt(p.slice(slash + 1), 10) || 1);
+                base = p.slice(0, slash);
             }
-            if (base === "*")
-                base = min + "-" + max;
-
-            if (base.indexOf("-") >= 0) {
-                var lo = parseInt(base.split("-")[0], 10), hi = parseInt(base.split("-")[1], 10);
-                if (!isNaN(lo) && !isNaN(hi))
-                    for (var v = lo; v <= hi; v += step) allowed[v] = true;
-
+            var lo, hi;
+            if (base === "*") {
+                lo = min;
+                hi = max;
+            } else if (base.indexOf("-") >= 0) {
+                lo = parseInt(base.split("-")[0], 10);
+                hi = parseInt(base.split("-")[1], 10);
             } else {
-                var single = parseInt(base, 10);
-                if (!isNaN(single))
-                    allowed[single] = true;
-                else if (step > 1 && p.indexOf("/") >= 0)
-                    for (var v2 = min; v2 <= max; v2 += step) allowed[v2] = true;
+                // "5/15" is a range from 5 to the end of the field.
+                lo = parseInt(base, 10);
+                hi = slash >= 0 ? max : lo;
             }
+            if (isNaN(lo) || isNaN(hi))
+                continue;
+
+            lo = Math.max(lo, min);
+            hi = Math.min(hi, max);
+            for (var v = lo; v <= hi; v += step) allowed[v] = true;
         }
         return allowed;
+    }
+
+    function _sortedValues(allowed) {
+        var out = [];
+        for (var key in allowed) out.push(parseInt(key, 10));
+        return out.sort(function(a, b) {
+            return a - b;
+        });
     }
 
     function _nextCronRun(cron, from) {
@@ -128,17 +165,38 @@ BarWidget {
         var fmin = root._cronField(f[0], 0, 59), fhour = root._cronField(f[1], 0, 23);
         var fdom = root._cronField(f[2], 1, 31), fmonth = root._cronField(f[3], 1, 12), fdow = root._cronField(f[4], 0, 7);
         var domStar = String(f[2]).trim() === "*", dowStar = String(f[4]).trim() === "*";
-        var d = new Date(from.getTime());
-        d.setSeconds(0, 0);
-        d.setMinutes(d.getMinutes() + 1);
-        for (var guard = 0; guard < 366 * 24 * 60; guard++) {
-            var monthOk = fmonth[d.getMonth() + 1] === true, domOk = fdom[d.getDate()] === true;
-            var dow = d.getDay(), dowOk = (fdow[dow] === true) || (dow === 0 && fdow[7] === true);
-            var dayOk = (domStar && dowStar) ? true : (domStar ? dowOk : (dowStar ? domOk : (domOk || dowOk)));
-            if (monthOk && dayOk && fhour[d.getHours()] === true && fmin[d.getMinutes()] === true)
-                return d;
+        var hours = root._sortedValues(fhour), minutes = root._sortedValues(fmin);
+        var start = new Date(from.getTime());
+        start.setSeconds(0, 0);
+        start.setMinutes(start.getMinutes() + 1);
+        // Walk whole days and only look at the clock on a day that matches.
+        // Stepping minute by minute froze the shell for about half a second
+        // on a yearly schedule and up to two on one that never matches
+        // (Feb 30), on every keystroke in the cron field.
+        for (var offset = 0; offset <= root.cronHorizonDays; offset++) {
+            var day = new Date(start.getFullYear(), start.getMonth(), start.getDate() + offset);
+            if (fmonth[day.getMonth() + 1] !== true)
+                continue;
 
-            d.setMinutes(d.getMinutes() + 1);
+            var domOk = fdom[day.getDate()] === true;
+            var dow = day.getDay(), dowOk = (fdow[dow] === true) || (dow === 0 && fdow[7] === true);
+            var dayOk = (domStar && dowStar) ? true : (domStar ? dowOk : (dowStar ? domOk : (domOk || dowOk)));
+            if (!dayOk)
+                continue;
+
+            for (var h = 0; h < hours.length; h++) {
+                for (var m = 0; m < minutes.length; m++) {
+                    var run = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hours[h], minutes[m], 0, 0);
+                    // A time skipped by a daylight-saving change comes back
+                    // as a different hour: it does not exist on this day.
+                    if (run.getHours() !== hours[h] || run.getMinutes() !== minutes[m])
+                        continue;
+
+                    if (run.getTime() >= start.getTime())
+                        return run;
+
+                }
+            }
         }
         return null;
     }
@@ -207,16 +265,28 @@ BarWidget {
         return root._cronFieldOk(f[0], 0, 59) && root._cronFieldOk(f[1], 0, 23) && root._cronFieldOk(f[2], 1, 31) && root._cronFieldOk(f[3], 1, 12) && root._cronFieldOk(f[4], 0, 7);
     }
 
+    function _startTimer(ms) {
+        root.nextCheckAt = Date.now() + ms;
+        root._sleep();
+    }
+
+    // (Re)start the timer for what is left of the wait, a day at most.
+    function _sleep() {
+        checkTimer.interval = Math.max(1, Math.min(root.nextCheckAt - Date.now(), root.maxTimerMs));
+        checkTimer.restart();
+    }
+
     function _scheduleArm() {
         var nxt = root._nextScheduleRun(root.schedule, new Date());
         if (nxt) {
-            checkTimer.interval = Math.max(1000, nxt.getTime() - Date.now());
-            checkTimer.repeat = false;
-        } else {
-            checkTimer.interval = 60 * 1000;
-            checkTimer.repeat = true;
+            root._startTimer(Math.max(1000, nxt.getTime() - Date.now()));
+            return ;
         }
-        checkTimer.start();
+        // A cron schedule with no run in sight (Feb 30). Nothing is due, so
+        // nothing is probed; look again in a minute in case that changes.
+        root.nextCheckAt = 0;
+        checkTimer.interval = 60 * 1000;
+        checkTimer.restart();
     }
 
     function _formatTime(ms) {
@@ -226,11 +296,17 @@ BarWidget {
         return (ms / 1000).toFixed(2) + "s";
     }
 
-    function dotColor(s) {
-        if (!s || s.up === null)
-            return Qt.lighter(Color.background, 1.3);
+    function urgentColor() {
+        return root.bar ? root.bar.urgent : Color.urgent;
+    }
 
-        return s.up ? Color.accent : root.bar.urgent;
+    function dotColor(s) {
+        // Muted reads on light and dark bars alike; a lightened background
+        // was invisible on a light bar.
+        if (!root.configured || !s || s.up === null)
+            return Color.muted;
+
+        return s.up ? root.upColor : root.urgentColor();
     }
 
     // --- Public API ---
@@ -291,25 +367,19 @@ BarWidget {
     }
 
     function persist(patch) {
-        var urlChanged = patch && patch.url !== undefined && patch.url !== root.url;
-        var schedChanged = patch && patch.schedule !== undefined;
-        if (patch) {
-            if (patch.url !== undefined)
-                root.url = patch.url;
-
-            if (patch.label !== undefined)
-                root.label = patch.label;
-
-            if (patch.schedule !== undefined)
-                root.schedule = root._parseSchedule(patch.schedule);
-
-        }
+        patch = patch || {
+        };
         var entry = {
             "id": root.moduleName,
-            "url": root.url,
-            "label": root.label,
-            "schedule": root.schedule
+            "url": patch.url !== undefined ? patch.url : root.url,
+            "label": patch.label !== undefined ? patch.label : root.label,
+            "schedule": patch.schedule !== undefined ? root._parseSchedule(patch.schedule) : root.schedule
         };
+        var urlChanged = entry.url !== root.url;
+        var schedChanged = JSON.stringify(entry.schedule) !== JSON.stringify(root.schedule);
+        // url, label and schedule are bound to settings. Assigning the entry
+        // updates all three; assigning them one by one would break those
+        // bindings, and later changes to shell.json would be ignored.
         root.settings = entry;
         if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
             root.bar.shell.updateEntryInline(root.moduleName, entry);
@@ -334,11 +404,24 @@ BarWidget {
         root.arm();
     }
 
-    function arm() {
-        if (!root.configured)
+    function _startProbe() {
+        if (!root.configured || probeProcess.running)
             return ;
 
+        root.probedUrl = root.url;
         probeProcess.running = true;
+    }
+
+    function arm() {
+        if (!root.configured) {
+            // Stopped: no more checks, and no stale up/down left on the dot.
+            checkTimer.stop();
+            root.status = root.emptyStatus();
+            root.lastCheckAt = 0;
+            root.nextCheckAt = 0;
+            return ;
+        }
+        root._startProbe();
         root._scheduleArm();
     }
 
@@ -357,6 +440,16 @@ BarWidget {
     function toggle() {
         if (panelLoader.item)
             panelLoader.item.toggle();
+
+    }
+
+    // Deferred, so that url, label and schedule have all taken their new
+    // values first. Syncing from inside onUrlChanged read the old schedule,
+    // which put a cron expression that had just been saved back to the
+    // previous one in the panel.
+    function syncPanel() {
+        if (panelLoader.item)
+            panelLoader.item.syncFromWidget();
 
     }
 
@@ -386,32 +479,43 @@ BarWidget {
     // === 8. SIGNAL HANDLERS ===
     onBarChanged: injectPanel()
     onUrlChanged: {
-        if (panelLoader.item)
-            panelLoader.item.syncFromWidget();
-
+        // The history and the status belong to the URL that was being
+        // checked; the new one is "checking" until its first result.
+        root.history = [];
+        root.status = root.emptyStatus();
+        root.lastCheckAt = 0;
+        Qt.callLater(root.syncPanel);
         Qt.callLater(function() {
             root.arm();
         });
     }
-    onLabelChanged: {
-        if (panelLoader.item)
-            panelLoader.item.syncFromWidget();
-
-    }
+    onLabelChanged: Qt.callLater(root.syncPanel)
     Component.onCompleted: Qt.callLater(root.arm)
 
     // === 6. CHILD OBJECTS ===
     Timer {
         id: checkTimer
 
+        objectName: "checkTimer"
         interval: 30000
         repeat: false
         running: false
         onTriggered: {
-            if (root.isCronSchedule(root.parseSchedule(root.schedule)))
-                root._scheduleArm();
+            if (!root.configured)
+                return ;
 
-            probeProcess.running = true;
+            // Nothing was due: the schedule had no run in sight.
+            if (root.nextCheckAt <= 0) {
+                root._scheduleArm();
+                return ;
+            }
+            // Woken part-way through a wait too long for one timer.
+            if (root.nextCheckAt - Date.now() > 500) {
+                root._sleep();
+                return ;
+            }
+            root._scheduleArm();
+            root._startProbe();
         }
     }
 
@@ -423,19 +527,22 @@ BarWidget {
         // shell string), and timing comes from curl itself.
         command: ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{time_total}", "--connect-timeout", "5", "--max-time", "10", "--proto", "=https,http", "--", root.url]
         onExited: function(exitCode) {
+            // The URL was cleared or changed while curl was running, so this
+            // result is for something that is no longer being monitored.
+            if (root.probedUrl !== root.url) {
+                Qt.callLater(root._startProbe);
+                return ;
+            }
             var now = new Date();
             var st = root.emptyStatus();
             st.lastChecked = Qt.formatDateTime(now, "dd MMM HH:mm:ss");
             if (exitCode === 0 && probeOut.data) {
                 var parts = String(probeOut.data).trim().split(" ");
                 var code = parts[0], time = Math.round(parseFloat(parts[1]) * 1000) || 0;
-                if (root.isCronSchedule(root.parseSchedule(root.schedule))) {
+                if (root.isCronSchedule(root.parseSchedule(root.schedule)))
                     root._scheduleArm();
-                } else {
-                    checkTimer.interval = root.scheduleMs(root.schedule);
-                    checkTimer.repeat = true;
-                    checkTimer.start();
-                }
+                else
+                    root._startTimer(root.scheduleMs(root.schedule));
                 if (code && (code[0] === "2" || code[0] === "3")) {
                     st.up = true;
                     st.responseTime = time;
@@ -450,13 +557,17 @@ BarWidget {
                 st.up = false;
                 st.consecutiveFailures = (root.status.consecutiveFailures || 0) + 1;
                 st.lastError = exitCode === 28 ? "Timeout" : "Connection failed";
-                if (!root.isCronSchedule(root.parseSchedule(root.schedule))) {
-                    checkTimer.interval = root.scheduleMs(root.schedule);
-                    checkTimer.repeat = true;
-                    checkTimer.start();
-                }
+                if (!root.isCronSchedule(root.parseSchedule(root.schedule)))
+                    root._startTimer(root.scheduleMs(root.schedule));
+
             }
             root.status = st;
+            root.lastCheckAt = now.getTime();
+            root.history = root.history.concat([{
+                "up": st.up,
+                "ms": st.responseTime,
+                "at": now.getTime()
+            }]).slice(-root.historyCapacity);
         }
 
         stdout: StdioCollector {
@@ -504,6 +615,7 @@ BarWidget {
             spacing: 6
 
             Rectangle {
+                objectName: "statusDot"
                 anchors.verticalCenter: parent.verticalCenter
                 width: 10
                 height: 10
@@ -521,11 +633,13 @@ BarWidget {
             }
 
             Text {
+                objectName: "barLabel"
                 visible: root.label !== ""
                 anchors.verticalCenter: parent.verticalCenter
+                // The label is user-supplied: never parse it as rich text.
+                textFormat: Text.PlainText
                 text: root.label
-                // CONVENTION-EXCEPTION: fallback color for null bar context
-                color: root.bar ? root.bar.foreground : Style.colorText
+                color: root.bar ? root.bar.foreground : Color.foreground
                 font.family: root.bar ? root.bar.fontFamily : Style.font.family
                 font.pixelSize: Style.font.body
             }
