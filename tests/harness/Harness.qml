@@ -18,6 +18,8 @@ QtObject {
     // The real host writes shell.json and then pushes the new entry back
     // into widget.settings. Turn this off to test a write that never lands.
     property bool echoSettings: true
+    // Makes the next writes throw, as a shell that cannot save would.
+    property bool persistFails: false
     property var widget: null
     property QtObject bar: null
     property var _created: []
@@ -132,6 +134,7 @@ QtObject {
         bar = null;
         persisted = [];
         echoSettings = true;
+        persistFails = false;
     }
 
     _barApi: Component {
@@ -143,6 +146,9 @@ QtObject {
     _shell: Component {
         QtObject {
             function updateEntryInline(id, settings) {
+                if (harness.persistFails)
+                    throw new Error("shell.json could not be written");
+
                 var entry = JSON.parse(JSON.stringify(settings));
                 harness.persisted = harness.persisted.concat([entry]);
                 if (!harness.echoSettings)

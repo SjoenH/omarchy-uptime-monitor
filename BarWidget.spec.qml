@@ -133,6 +133,24 @@ Item {
         h.compare(w.status.up, null);
     }
 
+    // While open, the panel is a full-screen overlay that takes every click.
+    // A save that throws must not leave it up with no way to dismiss it.
+    function* test_thePanelClosesEvenWhenSavingFails() {
+        var w = monitor(server + "/ok");
+        yield 400;
+        w.open();
+        yield 50;
+        h.persistFails = true;
+        var threw = false;
+        try {
+            w.close();
+        } catch (e) {
+            threw = true;
+        }
+        h.verify(threw, "the failed save is reported");
+        h.compare(w.opened, false, "and the panel is closed all the same");
+    }
+
     function* test_startingAgainAfterStop() {
         var w = monitor(server + "/ok");
         yield 400;
