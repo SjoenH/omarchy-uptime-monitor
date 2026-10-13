@@ -87,7 +87,12 @@ ShellRoot {
             runner.failed++;
 
         console.log("SPEC " + (error ? "FAIL " : "PASS ") + runner.names[runner.index] + (error ? " -- " + error : ""));
-        harness.cleanup();
+        // A cleanup that throws must not stop the run from moving on.
+        try {
+            harness.cleanup();
+        } catch (e) {
+            console.log("SPEC cleanup failed: " + e);
+        }
         pause.then = runner.next;
         pause.interval = 20;
         pause.start();

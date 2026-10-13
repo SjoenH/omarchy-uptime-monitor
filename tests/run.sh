@@ -37,20 +37,49 @@ cp "$here/harness/KeyboardPanel.qml" "$work/Ui/KeyboardPanel.qml"
 
 if [[ $# -gt 0 ]]; then specs=("$@"); else specs=("$plugin"/*.spec.qml); fi
 
+# Quickshell runs the shell in a child of `qs`, and after a crash it leaves a
+# reporter process behind. Neither exits with `qs`, and either would keep a
+# pipe open forever, so each run writes to a file and is hunted down afterwards
+# by a marker in its environment.
+kill_leftovers() {
+  local env
+  for env in /proc/[0-9]*/environ; do
+    if grep -qzx "SPEC_RUN_ID=$1" "$env" 2>/dev/null; then
+      kill -9 "$(basename "$(dirname "$env")")" 2>/dev/null
+    fi
+  done
+}
+
 # Each spec runs once west and once east of UTC, so date math that mixes
 # local and UTC time fails here rather than for a user in another timezone.
 status=0
+limit=${SPEC_TIMEOUT:-120}
 for spec in "${specs[@]}"; do
   [[ $spec == /* ]] || spec="$PWD/$spec"
   for tz in ${SPEC_TIMEZONES:-America/Los_Angeles Pacific/Auckland}; do
     echo "== $(basename "$spec") (TZ=$tz)"
-    TZ=$tz PLUGIN_DIR="$plugin" SPEC_FILE="$spec" QT_QPA_PLATFORM=offscreen \
-      timeout --kill-after=3 "${SPEC_TIMEOUT:-120}" qs -p "$work" 2>&1 \
-      | sed -u 's/\x1b\[[0-9;]*m//g' \
-      | grep --line-buffered -E "SPEC |$(basename "$plugin")/" \
-      | grep --line-buffered -v "outside of the config folder" \
-      | sed -u 's/^ *DEBUG qml: SPEC //'
-    rc=${PIPESTATUS[0]}
+    run_id="spec-$$-$RANDOM"
+    log="$work/run.log"
+    SPEC_RUN_ID=$run_id TZ=$tz PLUGIN_DIR="$plugin" SPEC_FILE="$spec" QT_QPA_PLATFORM=offscreen \
+      qs -p "$work" >"$log" 2>&1 &
+    pid=$!
+    started=$SECONDS
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS - started < limit )); do
+      sleep 0.2
+    done
+    rc=0
+    if kill -0 "$pid" 2>/dev/null; then
+      rc=124
+    else
+      wait "$pid" || rc=$?
+    fi
+    kill_leftovers "$run_id"
+    wait "$pid" 2>/dev/null
+    sed 's/\x1b\[[0-9;]*m//g' "$log" \
+      | grep -E "SPEC |$(basename "$plugin")/|Quickshell has crashed" \
+      | grep -v "outside of the config folder" \
+      | sed 's/^ *DEBUG qml: SPEC //'
+    [[ $rc -eq 124 ]] && echo "TIMED OUT after ${limit}s"
     [[ $rc -eq 0 ]] || status=1
   done
 done
