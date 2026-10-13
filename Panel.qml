@@ -101,8 +101,21 @@ Panel {
         return root.hostWidget.cronSyntaxOk(root.edCron);
     }
 
+    // Well-formed and with a run ahead of it. "0 0 30 2 *" is well-formed
+    // and never runs.
+    function cronRuns() {
+        return root.cronOk() && root.hostWidget.nextCronRun(root.edCron, new Date()) !== null;
+    }
+
+    function cronHint() {
+        if (!root.cronOk())
+            return "Needs 5 cron fields";
+
+        return root.cronRuns() ? "Next: " + root.nextCronText() : "This schedule never runs";
+    }
+
     function canCommit() {
-        return root.validUrl() && (!root.edIsCron || root.cronOk());
+        return root.validUrl() && (!root.edIsCron || root.cronRuns());
     }
 
     function buildSchedule() {
@@ -599,13 +612,13 @@ Panel {
                             text: root.edCron
                             placeholderText: "min hour dom month dow (0 * * * *)"
                             foreground: root.foreground
-                            accent: root.cronOk() ? Color.accent : root.urgentColor()
+                            accent: root.cronRuns() ? Color.accent : root.urgentColor()
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.body
                             Accessible.name: "Cron expression"
                             onTextChanged: root.edCron = text
                             onAccepted: {
-                                if (root.cronOk())
+                                if (root.cronRuns())
                                     root.applySchedule();
 
                             }
@@ -617,9 +630,9 @@ Panel {
                             width: parent.width
                             visible: root.edCron.trim() !== ""
                             textFormat: Text.PlainText
-                            text: root.cronOk() ? "Next: " + root.nextCronText() : "Needs 5 cron fields"
+                            text: root.cronHint()
                             // CONVENTION-EXCEPTION: status indicator colors
-                            color: root.cronOk() ? root.dim : root.urgentColor()
+                            color: root.cronRuns() ? root.dim : root.urgentColor()
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                             wrapMode: Text.WordWrap

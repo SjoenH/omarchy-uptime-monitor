@@ -88,6 +88,57 @@ Item {
         h.compare(w.status.lastError, "");
     }
 
+    // --- Waiting -----------------------------------------------------------
+
+    // Regression: the wait went straight into Timer.interval, which is 32
+    // bits. Past 24.8 days it wrapped negative, the check never ran and Qt
+    // logged an error in a tight loop.
+    function* test_aWaitLongerThanATimerCanHoldIsSleptInPieces() {
+        var w = monitor(server + "/ok", {
+            "value": 30,
+            "unit": "day"
+        });
+        yield 500;
+        var timer = h.byName("checkTimer");
+        var wait = w.nextCheckAt - Date.now();
+        h.verify(Math.abs(wait - 30 * 8.64e+07) < 5000, "the next check is 30 days out, got " + wait);
+        h.verify(timer.running, "the timer is running");
+        h.verify(timer.interval > 0 && timer.interval <= w.maxTimerMs, "with an interval it can hold, got " + timer.interval);
+        // Waking up early is not a check.
+        var checks = w.history.length;
+        timer.triggered();
+        yield 300;
+        h.compare(w.history.length, checks, "no probe on an early wake");
+        h.verify(timer.running && timer.interval > 0, "and it goes back to sleep");
+        h.verify(Math.abs(w.nextCheckAt - Date.now() - 30 * 8.64e+07) < 5000, "still due in 30 days");
+    }
+
+    function* test_aYearlyCronScheduleKeepsAValidTimer() {
+        var w = monitor(server + "/ok", {
+            "cron": "0 0 1 1 *"
+        });
+        yield 500;
+        var timer = h.byName("checkTimer");
+        h.verify(timer.running && timer.interval > 0 && timer.interval <= w.maxTimerMs, "interval " + timer.interval);
+        h.compare(stamp(new Date(w.nextCheckAt)).slice(5), "01-01 00:00");
+    }
+
+    // Regression: a schedule with no run ahead fell back to a check every
+    // minute.
+    function* test_aScheduleThatNeverRunsIsNotProbed() {
+        var w = monitor(server + "/ok", {
+            "cron": "0 0 30 2 *"
+        });
+        yield 500;
+        h.compare(w.history.length, 1, "the first check still runs when the URL is set");
+        h.compare(w.nextCheckAt, 0, "and nothing is due after it");
+        var timer = h.byName("checkTimer");
+        timer.triggered();
+        yield 300;
+        h.compare(w.history.length, 1, "waking up does not probe");
+        h.verify(timer.running, "it keeps looking for a run");
+    }
+
     // --- Stopping ----------------------------------------------------------
 
     // Regression: Stop left the URL in the field, and closing the panel
@@ -164,6 +215,25 @@ Item {
         h.compare(w.status.up, true);
     }
 
+    // Regression: the old URL's Up/Down and failure count carried over to
+    // the new URL until its first result came in.
+    function* test_aNewUrlStartsFromChecking() {
+        var w = monitor(unreachable, {
+            "value": 1,
+            "unit": "sec"
+        });
+        yield 2600;
+        h.verify(w.status.consecutiveFailures >= 2);
+        w.persist({
+            "url": server + "/slow-error"
+        });
+        yield 200;
+        h.compare(w.status.up, null, "checking, not the old URL's Down");
+        h.compare(w.status.consecutiveFailures, 0);
+        yield 2000;
+        h.compare(w.status.consecutiveFailures, 1, "the count starts again");
+    }
+
     // --- Settings ----------------------------------------------------------
 
     // Regression: persist() assigned url/label/schedule directly, which broke
@@ -202,6 +272,49 @@ Item {
         yield 500;
         h.compare(w.url, server + "/ok");
         h.compare(w.status.up, true);
+    }
+
+    // Regression: the panel re-read the widget from inside onUrlChanged,
+    // before the schedule had taken its new value, so a cron expression
+    // typed and started was put back to the old one in the field, and then
+    // saved over the new one when the panel closed.
+    function* test_startingWithATypedCronKeepsIt() {
+        var w = monitor("");
+        yield 50;
+        w.open();
+        yield 50;
+        var panel = h.byName("uptimeMonitorPanel");
+        panel.switchMode("cron");
+        yield 50;
+        var cron = h.byName("cronField");
+        h.click(cron);
+        cron.selectAll();
+        h.type("*/5 * * * *");
+        h.click(h.byName("urlField"));
+        h.type(server + "/ok");
+        h.click(h.byName("monitorButton"));
+        yield 500;
+        h.compare(w.schedule.cron, "*/5 * * * *");
+        h.compare(panel.edCron, "*/5 * * * *", "the field keeps what was typed");
+        w.close();
+        yield 100;
+        h.compare(h.lastPersisted().schedule.cron, "*/5 * * * *", "and closing does not save the old one back");
+    }
+
+    function* test_aCronThatNeverRunsCannotBeSaved() {
+        var w = monitor(server + "/ok");
+        yield 300;
+        w.open();
+        yield 50;
+        var panel = h.byName("uptimeMonitorPanel");
+        panel.switchMode("cron");
+        yield 50;
+        h.compare(h.byName("cronHint").text.indexOf("Next: "), 0);
+        panel.edCron = "0 0 30 2 *";
+        h.compare(h.byName("cronHint").text, "This schedule never runs");
+        h.compare(panel.canCommit(), false);
+        panel.edCron = "0 0 30";
+        h.compare(h.byName("cronHint").text, "Needs 5 cron fields");
     }
 
     function test_aBareHostGetsHttps() {

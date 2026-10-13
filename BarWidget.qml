@@ -38,6 +38,10 @@ BarWidget {
     // empty with the shell.
     property var history: []
     readonly property int historyCapacity: 40
+    // Qt's Timer holds its interval in 32 bits, so a wait of more than 24.8
+    // days wraps around: the timer never fires and Qt logs an error in a
+    // tight loop. A longer wait is slept through a day at a time.
+    readonly property int maxTimerMs: 24 * 60 * 60 * 1000
 
     // === 9. FUNCTIONS (private first, then public) ===
     function _emptyStatus() {
@@ -261,19 +265,28 @@ BarWidget {
         return root._cronFieldOk(f[0], 0, 59) && root._cronFieldOk(f[1], 0, 23) && root._cronFieldOk(f[2], 1, 31) && root._cronFieldOk(f[3], 1, 12) && root._cronFieldOk(f[4], 0, 7);
     }
 
-    function _startTimer(ms, repeat) {
-        checkTimer.interval = ms;
-        checkTimer.repeat = repeat;
-        checkTimer.restart();
+    function _startTimer(ms) {
         root.nextCheckAt = Date.now() + ms;
+        root._sleep();
+    }
+
+    // (Re)start the timer for what is left of the wait, a day at most.
+    function _sleep() {
+        checkTimer.interval = Math.max(1, Math.min(root.nextCheckAt - Date.now(), root.maxTimerMs));
+        checkTimer.restart();
     }
 
     function _scheduleArm() {
         var nxt = root._nextScheduleRun(root.schedule, new Date());
-        if (nxt)
-            root._startTimer(Math.max(1000, nxt.getTime() - Date.now()), false);
-        else
-            root._startTimer(60 * 1000, true);
+        if (nxt) {
+            root._startTimer(Math.max(1000, nxt.getTime() - Date.now()));
+            return ;
+        }
+        // A cron schedule with no run in sight (Feb 30). Nothing is due, so
+        // nothing is probed; look again in a minute in case that changes.
+        root.nextCheckAt = 0;
+        checkTimer.interval = 60 * 1000;
+        checkTimer.restart();
     }
 
     function _formatTime(ms) {
@@ -430,6 +443,16 @@ BarWidget {
 
     }
 
+    // Deferred, so that url, label and schedule have all taken their new
+    // values first. Syncing from inside onUrlChanged read the old schedule,
+    // which put a cron expression that had just been saved back to the
+    // previous one in the panel.
+    function syncPanel() {
+        if (panelLoader.item)
+            panelLoader.item.syncFromWidget();
+
+    }
+
     function injectPanel() {
         if (!panelLoader.item)
             return ;
@@ -456,26 +479,24 @@ BarWidget {
     // === 8. SIGNAL HANDLERS ===
     onBarChanged: injectPanel()
     onUrlChanged: {
-        // The history belongs to the URL that was being checked.
+        // The history and the status belong to the URL that was being
+        // checked; the new one is "checking" until its first result.
         root.history = [];
-        if (panelLoader.item)
-            panelLoader.item.syncFromWidget();
-
+        root.status = root.emptyStatus();
+        root.lastCheckAt = 0;
+        Qt.callLater(root.syncPanel);
         Qt.callLater(function() {
             root.arm();
         });
     }
-    onLabelChanged: {
-        if (panelLoader.item)
-            panelLoader.item.syncFromWidget();
-
-    }
+    onLabelChanged: Qt.callLater(root.syncPanel)
     Component.onCompleted: Qt.callLater(root.arm)
 
     // === 6. CHILD OBJECTS ===
     Timer {
         id: checkTimer
 
+        objectName: "checkTimer"
         interval: 30000
         repeat: false
         running: false
@@ -483,9 +504,17 @@ BarWidget {
             if (!root.configured)
                 return ;
 
-            if (root.isCronSchedule(root.parseSchedule(root.schedule)))
+            // Nothing was due: the schedule had no run in sight.
+            if (root.nextCheckAt <= 0) {
                 root._scheduleArm();
-
+                return ;
+            }
+            // Woken part-way through a wait too long for one timer.
+            if (root.nextCheckAt - Date.now() > 500) {
+                root._sleep();
+                return ;
+            }
+            root._scheduleArm();
             root._startProbe();
         }
     }
@@ -513,7 +542,7 @@ BarWidget {
                 if (root.isCronSchedule(root.parseSchedule(root.schedule)))
                     root._scheduleArm();
                 else
-                    root._startTimer(root.scheduleMs(root.schedule), true);
+                    root._startTimer(root.scheduleMs(root.schedule));
                 if (code && (code[0] === "2" || code[0] === "3")) {
                     st.up = true;
                     st.responseTime = time;
@@ -529,7 +558,7 @@ BarWidget {
                 st.consecutiveFailures = (root.status.consecutiveFailures || 0) + 1;
                 st.lastError = exitCode === 28 ? "Timeout" : "Connection failed";
                 if (!root.isCronSchedule(root.parseSchedule(root.schedule)))
-                    root._startTimer(root.scheduleMs(root.schedule), true);
+                    root._startTimer(root.scheduleMs(root.schedule));
 
             }
             root.status = st;
